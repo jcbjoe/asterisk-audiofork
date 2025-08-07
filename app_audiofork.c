@@ -388,15 +388,15 @@ struct audiofork_ds {
 
 static void audiofork_ds_destroy(void *data)
 {
-	struct audiofork_ds *audiofork_ds = data;
+    struct audiofork_ds *audiofork_ds = data;
 
-	ast_mutex_lock(&audiofork_ds->lock);
-	audiofork_ds->audiohook = NULL;
-	audiofork_ds->destruction_ok = 1;
-	ast_free(audiofork_ds->wsserver);
-	ast_free(audiofork_ds->beep_id);
-	ast_cond_signal(&audiofork_ds->destruction_condition);
-	ast_mutex_unlock(&audiofork_ds->lock);
+    ast_mutex_lock(&audiofork_ds->lock);
+    audiofork_ds->audiohook = NULL;
+    audiofork_ds->destruction_ok = 1;
+    ast_free(audiofork_ds->wsserver);
+    ast_free(audiofork_ds->beep_id);
+    ast_cond_signal(&audiofork_ds->destruction_condition);
+    ast_mutex_unlock(&audiofork_ds->lock);
 }
 
 static const struct ast_datastore_info audiofork_ds_info = {
@@ -434,58 +434,65 @@ static int start_audiofork(struct ast_channel *chan, struct ast_audiohook *audio
 */
 static enum ast_websocket_result audiofork_ws_connect(struct audiofork *audiofork)
 {
-	enum ast_websocket_result result;
+    enum ast_websocket_result result;
 
-	ast_verb(2, "<%s> [AudioFork] (%s) Connecting to websocket server at: %s\n", ast_channel_name(audiofork->autochan->chan), audiofork->direction_string, audiofork->audiofork_ds->wsserver);
+    ast_verb(2, "<%s> [AudioFork] (%s) Connecting to websocket server at: %s\n", 
+        ast_channel_name(audiofork->autochan->chan), 
+        audiofork->direction_string, 
+        audiofork->audiofork_ds->wsserver);
 
-	// Check if we're running with TLS
-	if (audiofork->has_tls == 1) {
-		ast_verb(2, "<%s> [AudioFork] (%s) Creating to WebSocket server with TLS mode enabled\n", ast_channel_name(audiofork->autochan->chan), audiofork->direction_string);
-		audiofork->websocket = ast_websocket_client_create(audiofork->audiofork_ds->wsserver, "echo", audiofork->tls_cfg, &result);
-	} else {
-		ast_verb(2, "<%s> [AudioFork] (%s) Creating to WebSocket server without TLS\n", ast_channel_name(audiofork->autochan->chan), audiofork->direction_string);
-		audiofork->websocket = ast_websocket_client_create(audiofork->audiofork_ds->wsserver, "echo", NULL, &result);
-	}
+    if (audiofork->has_tls == 1) {
+        audiofork->websocket = ast_websocket_client_create(
+            audiofork->audiofork_ds->wsserver, "echo", 
+            audiofork->tls_cfg, &result);
+    } else {
+        audiofork->websocket = ast_websocket_client_create(
+            audiofork->audiofork_ds->wsserver, "echo", NULL, &result);
+    }
 
-	return result;
+    if (!audiofork->websocket) {
+        // Make sure we don't have a dangling websocket
+        return result;
+    }
+
+    if (result != WS_OK) {
+        // Clean up the websocket if it was created but connection failed
+        ast_websocket_unref(audiofork->websocket);
+        audiofork->websocket = NULL;
+        return result;
+    }
+
+    return result;
 }
 
 static void audiofork_free(struct audiofork *audiofork)
 {
-	if (audiofork) {
-		if (audiofork->audiofork_ds) {
-			ast_mutex_destroy(&audiofork->audiofork_ds->lock);
-			ast_cond_destroy(&audiofork->audiofork_ds->destruction_condition);
-			ast_free(audiofork->audiofork_ds);
-		}
+    if (audiofork) {
+		ast_audiohook_lock(&mixmonitor->audiohook);
+        if (audiofork->audiofork_ds) {
+            ast_mutex_destroy(&audiofork->audiofork_ds->lock);
+            ast_cond_destroy(&audiofork->audiofork_ds->destruction_condition);
+            ast_free(audiofork->audiofork_ds);
+        }
 
-		ast_free(audiofork->name);
-		ast_free(audiofork->post_process);
-		ast_free(audiofork->wsserver);
+        ast_free(audiofork->name);
+        ast_free(audiofork->post_process);
+        ast_free(audiofork->wsserver);
 
-		ast_verb(2, "[AudioFork] Closing websocket connection\n");
-		/*
-		* We need to lock because read_from_ws_and_queue() is probably waiting
-		* on the websocket file descriptor and will unblock and immediately try to
-		* check the websocket and read from it. We don't want to pull the
-		* websocket out from under it between the check and read.
-		*/
-		ao2_lock(audiofork);
-		if (audiofork->websocket) {
-			ast_verb(2, "[AudioFork] Calling ast_websocket_close\n");
-			ast_websocket_close(audiofork->websocket, 1011);
-			ast_websocket_unref(audiofork->websocket);
-			audiofork->websocket = NULL;
-		}
-		ao2_unlock(audiofork);
+        ast_verb(2, "[AudioFork] Closing websocket connection\n");
+        
+        if (audiofork->websocket) {
+            ast_verb(2, "[AudioFork] Calling ast_websocket_close\n");
+            ast_websocket_close(audiofork->websocket, 1011);
+            ast_websocket_unref(audiofork->websocket);
+            audiofork->websocket = NULL;
+        }
 
-		ao2_cleanup(audiofork);
+        /* clean stringfields BEFORE freeing the structure */
+        ast_string_field_free_memory(audiofork);
 
-		/* clean stringfields */
-		ast_string_field_free_memory(audiofork);
-
-		ast_free(audiofork);
-	}
+        ast_free(audiofork);  // Only one free, matching ast_calloc
+    }
 }
 
 
