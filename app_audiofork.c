@@ -468,7 +468,7 @@ static enum ast_websocket_result audiofork_ws_connect(struct audiofork *audiofor
 static void audiofork_free(struct audiofork *audiofork)
 {
     if (audiofork) {
-		ast_audiohook_lock(&mixmonitor->audiohook);
+		ast_audiohook_lock(&audiofork->audiohook);
         if (audiofork->audiofork_ds) {
             ast_mutex_destroy(&audiofork->audiofork_ds->lock);
             ast_cond_destroy(&audiofork->audiofork_ds->destruction_condition);
