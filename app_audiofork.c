@@ -141,12 +141,6 @@
 					<option name="T">
 						<para>comma separated TLS config for secure websocket connections</para>
 					</option>
-					<option name="R">
-						<para>Timeout for reconnections</para>
-					</option>
-					<option name="r">
-						<para>Number of times to attempt reconnect before closing connections</para>
-					</option>
 				</optionlist>
 			</parameter>
 			<parameter name="command">
@@ -315,8 +309,6 @@ struct audiofork {
 	char *tcert;
 	enum ast_audiohook_direction direction;
 	const char *direction_string;
-	int reconnection_attempts;
-	int reconnection_timeout;
 	char *post_process;
 	char *name;
 	ast_callid callid;
@@ -349,9 +341,7 @@ enum audiofork_flags {
 	MUXFLAG_BEEP_STOP = (1 << 13),
 	MUXFLAG_RWSYNC = (1 << 14),
 	MUXFLAG_DIRECTION = (1 << 15),
-	MUXFLAG_TLS = (1 << 16),
-	MUXFLAG_RECONNECTION_TIMEOUT = (1 << 17),
-	MUXFLAG_RECONNECTION_ATTEMPTS = (1 << 17),
+	MUXFLAG_TLS = (1 << 16)
 };
 
 enum audiofork_args {
@@ -363,8 +353,6 @@ enum audiofork_args {
 	OPT_ARG_RWSYNC,
 	OPT_ARG_DIRECTION,
 	OPT_ARG_TLS,
-	OPT_ARG_RECONNECTION_TIMEOUT,
-	OPT_ARG_RECONNECTION_ATTEMPTS,
 	OPT_ARG_ARRAY_SIZE,           /* Always last element of the enum */
 };
 
@@ -380,9 +368,7 @@ AST_APP_OPTIONS(audiofork_opts, {
 	AST_APP_OPTION_ARG('i', MUXFLAG_UID, OPT_ARG_UID),
 	AST_APP_OPTION_ARG('S', MUXFLAG_RWSYNC, OPT_ARG_RWSYNC),
 	AST_APP_OPTION_ARG('D', MUXFLAG_DIRECTION, OPT_ARG_DIRECTION),
-	AST_APP_OPTION_ARG('T', MUXFLAG_TLS, OPT_ARG_TLS),
-	AST_APP_OPTION_ARG('R', MUXFLAG_RECONNECTION_TIMEOUT, OPT_ARG_RECONNECTION_TIMEOUT),
-	AST_APP_OPTION_ARG('r', MUXFLAG_RECONNECTION_ATTEMPTS, OPT_ARG_RECONNECTION_ATTEMPTS),
+	AST_APP_OPTION_ARG('T', MUXFLAG_TLS, OPT_ARG_TLS)
 });
 
 struct audiofork_ds {
@@ -402,15 +388,15 @@ struct audiofork_ds {
 
 static void audiofork_ds_destroy(void *data)
 {
-	struct audiofork_ds *audiofork_ds = data;
+    struct audiofork_ds *audiofork_ds = data;
 
-	ast_mutex_lock(&audiofork_ds->lock);
-	audiofork_ds->audiohook = NULL;
-	audiofork_ds->destruction_ok = 1;
-	ast_free(audiofork_ds->wsserver);
-	ast_free(audiofork_ds->beep_id);
-	ast_cond_signal(&audiofork_ds->destruction_condition);
-	ast_mutex_unlock(&audiofork_ds->lock);
+    ast_mutex_lock(&audiofork_ds->lock);
+    audiofork_ds->audiohook = NULL;
+    audiofork_ds->destruction_ok = 1;
+    ast_free(audiofork_ds->wsserver);
+    ast_free(audiofork_ds->beep_id);
+    ast_cond_signal(&audiofork_ds->destruction_condition);
+    ast_mutex_unlock(&audiofork_ds->lock);
 }
 
 static const struct ast_datastore_info audiofork_ds_info = {
@@ -441,20 +427,6 @@ static int start_audiofork(struct ast_channel *chan, struct ast_audiohook *audio
 	return ast_audiohook_attach(chan, audiohook);
 }
 
-static int audiofork_ws_close(struct audiofork *audiofork)
-{
-	int ret;
-	ast_verb(2, "[AudioFork] Closing websocket connection\n");
-	if (audiofork->websocket) {
-		ast_verb(2, "[AudioFork] Calling ast_websocket_close\n");
-		ret = ast_websocket_close(audiofork->websocket, 1011);
-		return ret;
-	}
-
-	ast_verb(2, "[AudioFork] No reference to websocket, can't close connection\n");
-	return -1;
-}
-
 
 /*
 	1 = success
@@ -462,106 +434,65 @@ static int audiofork_ws_close(struct audiofork *audiofork)
 */
 static enum ast_websocket_result audiofork_ws_connect(struct audiofork *audiofork)
 {
-	enum ast_websocket_result result;
+    enum ast_websocket_result result;
 
-	if (audiofork->websocket) {
-		ast_verb(2, "<%s> [AudioFork] (%s) Reconnecting to websocket server at: %s\n",
-			ast_channel_name(audiofork->autochan->chan),
-			audiofork->direction_string,
-			audiofork->audiofork_ds->wsserver);
+    ast_verb(2, "<%s> [AudioFork] (%s) Connecting to websocket server at: %s\n", 
+        ast_channel_name(audiofork->autochan->chan), 
+        audiofork->direction_string, 
+        audiofork->audiofork_ds->wsserver);
 
-		// close the websocket connection before reconnecting
-		audiofork_ws_close(audiofork);
+    if (audiofork->has_tls == 1) {
+        audiofork->websocket = ast_websocket_client_create(
+            audiofork->audiofork_ds->wsserver, "echo", 
+            audiofork->tls_cfg, &result);
+    } else {
+        audiofork->websocket = ast_websocket_client_create(
+            audiofork->audiofork_ds->wsserver, "echo", NULL, &result);
+    }
 
-		ao2_cleanup(audiofork->websocket);
-	}
-	else {
-		ast_verb(2, "<%s> [AudioFork] (%s) Connecting to websocket server at: %s\n",
-			ast_channel_name(audiofork->autochan->chan),
-			audiofork->direction_string,
-			audiofork->audiofork_ds->wsserver);
-	}
+    if (!audiofork->websocket) {
+        // Make sure we don't have a dangling websocket
+        return result;
+    }
 
-	// Check if we're running with TLS
-	if (audiofork->has_tls == 1) {
-		ast_verb(2, "<%s> [AudioFork] (%s) Creating to WebSocket server with TLS mode enabled\n", ast_channel_name(audiofork->autochan->chan), audiofork->direction_string);
-		audiofork->websocket = ast_websocket_client_create(audiofork->audiofork_ds->wsserver, "echo", audiofork->tls_cfg, &result);
-	} else {
-		ast_verb(2, "<%s> [AudioFork] (%s) Creating to WebSocket server without TLS\n", ast_channel_name(audiofork->autochan->chan), audiofork->direction_string);
-		audiofork->websocket = ast_websocket_client_create(audiofork->audiofork_ds->wsserver, "echo", NULL, &result);
-	}
+    if (result != WS_OK) {
+        // Clean up the websocket if it was created but connection failed
+        ast_websocket_unref(audiofork->websocket);
+        audiofork->websocket = NULL;
+        return result;
+    }
 
-	return result;
-}
-
-/*
-	reconn_status
-	0 = OK
-	1 = FAILED
-*/
-static int audiofork_start_reconnecting(struct audiofork *audiofork)
-{
-	int counter= 0;
-	int status = 0;
-	int timeout = audiofork->reconnection_timeout;
-	int attempts = audiofork->reconnection_attempts;
-	int last_attempt = 0;
-	int now;
-	int delta;
-	int result;
-
-	while (counter < attempts) {
-		now = (int)time(NULL);
-		delta = now - last_attempt;
-
-		// small check to see if we should keep waiting on the reconnection. This uses the
-		// reconnection_timeout variable configured in the dialplan
-		if (last_attempt != 0 && delta <= timeout) {
-			// keep waiting
-			continue;
-		}
-
-		// try to reconnect
-		result = audiofork_ws_connect(audiofork);
-		if (result == WS_OK) {
-			status = 0;
-			last_attempt = 0;
-			break;
-		}
-
-		// reconnection failed...
-		// update our counter with the last reconnection attempt
-		last_attempt=(int)time(NULL);
-
-		ast_log(LOG_ERROR, "<%s> [AudioFork] (%s) Reconnection failed... trying again in %d seconds. %d attempts remaining reconn_now %d reconn_last_attempt %d\n", ast_channel_name(audiofork->autochan->chan), audiofork->direction_string, timeout, (attempts-counter), now, last_attempt);
-
-		counter ++;
-		status = 1;
-	}
-
-	return status;
+    return result;
 }
 
 static void audiofork_free(struct audiofork *audiofork)
 {
-	if (audiofork) {
-		if (audiofork->audiofork_ds) {
-			ast_mutex_destroy(&audiofork->audiofork_ds->lock);
-			ast_cond_destroy(&audiofork->audiofork_ds->destruction_condition);
-			ast_free(audiofork->audiofork_ds);
-		}
+    if (audiofork) {
+		ast_audiohook_lock(&audiofork->audiohook);
+        if (audiofork->audiofork_ds) {
+            ast_mutex_destroy(&audiofork->audiofork_ds->lock);
+            ast_cond_destroy(&audiofork->audiofork_ds->destruction_condition);
+            ast_free(audiofork->audiofork_ds);
+        }
 
-		ast_free(audiofork->name);
-		ast_free(audiofork->post_process);
-		ast_free(audiofork->wsserver);
+        ast_free(audiofork->name);
+        ast_free(audiofork->post_process);
+        ast_free(audiofork->wsserver);
 
-		audiofork_ws_close(audiofork);
+        ast_verb(2, "[AudioFork] Closing websocket connection\n");
+        
+        if (audiofork->websocket) {
+            ast_verb(2, "[AudioFork] Calling ast_websocket_close\n");
+            ast_websocket_close(audiofork->websocket, 1011);
+            ast_websocket_unref(audiofork->websocket);
+            audiofork->websocket = NULL;
+        }
 
-		/* clean stringfields */
-		ast_string_field_free_memory(audiofork);
+        /* clean stringfields BEFORE freeing the structure */
+        ast_string_field_free_memory(audiofork);
 
-		ast_free(audiofork);
-	}
+        ast_free(audiofork);  // Only one free, matching ast_calloc
+    }
 }
 
 
@@ -573,7 +504,6 @@ static void *audiofork_thread(void *obj)
 	char *channel_name_cleanup;
 	enum ast_websocket_result result;
 	int frames_sent = 0;
-	int reconn_status;
 
 	/* Keep callid association before any log messages */
 	if (audiofork->callid) {
@@ -637,22 +567,8 @@ static void *audiofork_thread(void *obj)
 
 			if (ast_websocket_write(audiofork->websocket, AST_WEBSOCKET_OPCODE_BINARY, cur->data.ptr, cur->datalen)) {
 
-				ast_log(LOG_ERROR, "<%s> [AudioFork] (%s) Could not write to websocket.  Reconnecting...\n", ast_channel_name(audiofork->autochan->chan), audiofork->direction_string);
-				reconn_status = audiofork_start_reconnecting(audiofork);
-
-				if (reconn_status == 1) {
-					audiofork->websocket = NULL;
-					audiofork->audiohook.status = AST_AUDIOHOOK_STATUS_SHUTDOWN;
-					break;
-				}
-
-				/* re-send the last frame */
-				if (ast_websocket_write(audiofork->websocket, AST_WEBSOCKET_OPCODE_BINARY, cur->data.ptr, cur->datalen)) {
-					ast_log(LOG_ERROR, "<%s> [AudioFork] (%s) Could not re-write to websocket.  Complete Failure.\n", ast_channel_name(audiofork->autochan->chan), audiofork->direction_string);
-
-					audiofork->audiohook.status = AST_AUDIOHOOK_STATUS_SHUTDOWN;
-					break;
-				}
+				ast_log(LOG_ERROR, "<%s> [AudioFork] (%s) Could not write to websocket.  Exiting...\n", ast_channel_name(audiofork->autochan->chan), audiofork->direction_string);
+				break;
 			}
 
 			frames_sent++;
@@ -766,8 +682,6 @@ static int launch_audiofork_thread(
 	const char *wsserver, unsigned int flags,
 	enum ast_audiohook_direction direction,
 	char* tcert,
-	int reconn_timeout,
-	int reconn_attempts,
 	int readvol, int writevol,
 	const char *post_process,
 	const char *uid_channel_var,
@@ -833,14 +747,6 @@ static int launch_audiofork_thread(
 	}
 
 	ast_verb(2, "<%s> [AudioFork] (%s) Setting Direction\n", ast_channel_name(chan), audiofork->direction_string);
-
-	// TODO: make this configurable
-	audiofork->reconnection_attempts = reconn_attempts;
-	// 5 seconds
-	audiofork->reconnection_timeout = reconn_timeout;
-
-	ast_verb(2, "<%s> [AudioFork] Setting reconnection attempts to %d\n", ast_channel_name(chan), audiofork->reconnection_attempts);
-	ast_verb(2, "<%s> [AudioFork] Setting reconnection timeout to %d\n", ast_channel_name(chan), audiofork->reconnection_timeout);
 
 	/* Server */
 	if (!ast_strlen_zero(wsserver)) {
@@ -915,8 +821,6 @@ static int audiofork_exec(struct ast_channel *chan, const char *data)
 	struct ast_flags flags = { 0 };
 	char *parse;
 	char *tcert = NULL;
-	int reconn_timeout = 5;
-	int reconn_attempts = 5;
 	AST_DECLARE_APP_ARGS(args, 
 		AST_APP_ARG(wsserver);
 		AST_APP_ARG(options);
@@ -1005,16 +909,6 @@ static int audiofork_exec(struct ast_channel *chan, const char *data)
 			tcert = ast_strdup ( S_OR(opts[OPT_ARG_TLS], "") );
 			ast_verb(2, "Parsing TLS result tcert: %s\n", tcert);
 		}
-
-		if (ast_test_flag(&flags, MUXFLAG_RECONNECTION_TIMEOUT)) {
-			reconn_timeout = atoi( S_OR(opts[OPT_ARG_RECONNECTION_TIMEOUT], "15") );
-			ast_verb(2, "Reconnection timeout set to: %d\n", reconn_timeout);
-		}
-
-		if (ast_test_flag(&flags, MUXFLAG_RECONNECTION_ATTEMPTS)) {
-			reconn_attempts = atoi( S_OR(opts[OPT_ARG_RECONNECTION_ATTEMPTS], "15") );
-			ast_verb(2, "Reconnection attempts set to: %d\n", reconn_attempts);
-		}
 	}
 
 	/* If there are no file writing arguments/options for the mix monitor, send a warning message and return -1 */
@@ -1035,8 +929,6 @@ static int audiofork_exec(struct ast_channel *chan, const char *data)
 		flags.flags,
 		direction,
 		tcert,
-		reconn_timeout,
-		reconn_attempts,
 		readvol,
 		writevol,
 		args.post_process, 

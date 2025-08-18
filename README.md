@@ -174,23 +174,6 @@ For example:
 AudioFork(wss://example.org/in,D(out)T(on))
 ```
 
-# Reconnecting closed sockets
-
-It is also possible to setup basic backoff for reconnection. By default, Audiofork is configured to reconnect to the WS server, and after a preconfigured number of attempts it will close the connection. These parameters, however, can be adjusted.
-
-To adjust the reconnection parameters, you can use the following parameters:
-
-```
-R(timeout_for_connection)
-r(number of times to attempt reconnection)
-```
-
-For instance, the following example will set the reconnection timeout to 10 seconds and will attempt to reconnect five times.
-
-```
-AudioFork(wss://example.org/in,R(10)r(5))
-```
-
 # Start an audio stream on demand
 
 It is possible to start an audio stream for a live call. We can do this by using AMI (asterisk manager interface). 
